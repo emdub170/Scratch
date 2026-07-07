@@ -1,2 +1,0 @@
-# Scratch
-Ipad Scratchbad
