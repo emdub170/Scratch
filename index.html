@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Scratchpad">
+<link rel="apple-touch-icon" href="icon.png">
+<title>Cockpit Scratchpad</title>
+<style>
+  :root {
+    --bg: #14181d;
+    --ink: #f2f2ec;
+    --btn-bg: rgba(255,255,255,0.10);
+    --btn-fg: rgba(242,242,236,0.75);
+    --btn-border: rgba(255,255,255,0.18);
+  }
+  body.light {
+    --bg: #fafaf6;
+    --ink: #16181c;
+    --btn-bg: rgba(0,0,0,0.06);
+    --btn-fg: rgba(22,24,28,0.70);
+    --btn-border: rgba(0,0,0,0.15);
+  }
+  html, body {
+    margin: 0; padding: 0;
+    width: 100%; height: 100%;
+    overflow: hidden;
+    position: fixed;
+    background: var(--bg);
+    overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none;
+    touch-action: none;
+  }
+  #pad {
+    position: fixed; inset: 0;
+    width: 100%; height: 100%;
+    touch-action: none;
+    background: var(--bg);
+  }
+  #bar {
+    position: fixed;
+    top: calc(env(safe-area-inset-top, 0px) + 8px);
+    right: calc(env(safe-area-inset-right, 0px) + 8px);
+    display: flex; gap: 8px;
+    z-index: 10;
+  }
+  #bar button {
+    font: 600 13px -apple-system, system-ui, sans-serif;
+    letter-spacing: 0.08em;
+    color: var(--btn-fg);
+    background: var(--btn-bg);
+    border: 1px solid var(--btn-border);
+    border-radius: 10px;
+    min-width: 52px; height: 40px;
+    padding: 0 10px;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #bar button:active { opacity: 0.5; }
+  #hint {
+    position: fixed;
+    bottom: calc(env(safe-area-inset-bottom, 0px) + 10px);
+    left: 0; right: 0;
+    text-align: center;
+    font: 500 12px -apple-system, system-ui, sans-serif;
+    color: var(--btn-fg);
+    pointer-events: none;
+    opacity: 1;
+    transition: opacity 1s;
+    z-index: 5;
+  }
+</style>
+</head>
+<body>
+<canvas id="pad"></canvas>
+<div id="bar">
+  <button id="undo" aria-label="Undo">UNDO</button>
+  <button id="clr" aria-label="Clear">CLR</button>
+  <button id="theme" aria-label="Day/Night">D/N</button>
+</div>
+<div id="hint">Pencil writes &middot; finger erases</div>
+<script>
+(function () {
+  "use strict";
+
+  var KEY = "cockpit-scratchpad-v1";
+  var canvas = document.getElementById("pad");
+  var ctx = canvas.getContext("2d");
+  var dpr = 1;
+
+  // ---- state ----
+  var strokes = [];        // [{pts:[[x,y,w],...]}] in CSS px
+  var current = null;      // stroke in progress
+  var undoStack = [];      // snapshots of strokes (max 25)
+  var penDownId = null;
+  var lastPenTime = 0;
+  var eraserId = null;     // pointerId of the one finger allowed to erase
+  var eraseSnapshotPending = null; // snapshot taken at erase-touch start, committed on first hit
+  var eraserPos = null;    // [x,y] ring feedback while erasing
+  var saveTimer = null;
+
+  var BASE_W = 3.2;        // base ink width (CSS px)
+  var ERASE_R = 26;        // eraser hit radius (CSS px)
+  var PALM_W = 35;         // touches wider than this are ignored (palm)
+
+  // ---- canvas sizing ----
+  function resize() {
+    dpr = window.devicePixelRatio || 1;
+    var w = window.innerWidth, h = window.innerHeight;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    canvas.style.width = w + "px";
+    canvas.style.height = h + "px";
+    redraw();
+  }
+
+  function inkColor() {
+    return getComputedStyle(document.body).getPropertyValue("--ink").trim() || "#f2f2ec";
+  }
+
+  // ---- drawing ----
+  function drawSegment(a, b) {
+    ctx.beginPath();
+    ctx.moveTo(a[0], a[1]);
+    ctx.lineTo(b[0], b[1]);
+    ctx.lineWidth = (a[2] + b[2]) / 2;
+    ctx.stroke();
+  }
+
+  function drawStroke(s) {
+    var p = s.pts;
+    if (p.length === 1) {
+      ctx.beginPath();
+      ctx.arc(p[0][0], p[0][1], p[0][2] / 2, 0, Math.PI * 2);
+      ctx.fill();
+      return;
+    }
+    for (var i = 1; i < p.length; i++) drawSegment(p[i - 1], p[i]);
+  }
+
+  function redraw() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = ctx.fillStyle = inkColor();
+    for (var i = 0; i < strokes.length; i++) drawStroke(strokes[i]);
+    if (current) drawStroke(current);
+    if (eraserPos) {
+      ctx.beginPath();
+      ctx.arc(eraserPos[0], eraserPos[1], ERASE_R, 0, Math.PI * 2);
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+  }
+
+  // ---- persistence ----
+  function save() {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(function () {
+      try {
+        localStorage.setItem(KEY, JSON.stringify({
+          v: 1,
+          theme: document.body.classList.contains("light") ? "light" : "dark",
+          strokes: strokes
+        }));
+      } catch (e) { /* storage full or unavailable — keep flying */ }
+    }, 250);
+  }
+
+  function load() {
+    try {
+      var raw = localStorage.getItem(KEY);
+      if (!raw) return;
+      var d = JSON.parse(raw);
+      if (d && d.strokes) strokes = d.strokes;
+      if (d && d.theme === "light") document.body.classList.add("light");
+    } catch (e) { strokes = []; }
+  }
+
+  // ---- undo ----
+  function pushUndo() {
+    undoStack.push(JSON.parse(JSON.stringify(strokes)));
+    if (undoStack.length > 25) undoStack.shift();
+  }
+
+  function undo() {
+    if (!undoStack.length) return;
+    strokes = undoStack.pop();
+    current = null;
+    redraw();
+    save();
+  }
+
+  // ---- erase ----
+  function eraseAt(x, y) {
+    var hit = false;
+    for (var i = strokes.length - 1; i >= 0; i--) {
+      var p = strokes[i].pts;
+      for (var j = 0; j < p.length; j++) {
+        var dx = p[j][0] - x, dy = p[j][1] - y;
+        if (dx * dx + dy * dy <= ERASE_R * ERASE_R) {
+          if (eraseSnapshotPending) {
+            undoStack.push(eraseSnapshotPending);
+            if (undoStack.length > 25) undoStack.shift();
+            eraseSnapshotPending = null;
+          }
+          strokes.splice(i, 1);
+          hit = true;
+          break;
+        }
+      }
+    }
+    return hit;
+  }
+
+  // ---- pointer handling ----
+  function pointOf(e) {
+    var pr = (e.pointerType === "pen" && e.pressure > 0) ? e.pressure : 0.5;
+    var w = Math.max(1, Math.min(9, BASE_W * 2 * pr));
+    return [Math.round(e.clientX * 10) / 10, Math.round(e.clientY * 10) / 10, Math.round(w * 100) / 100];
+  }
+
+  function isPalm(e) {
+    return (e.width && e.width > PALM_W) || (e.height && e.height > PALM_W);
+  }
+
+  function onDown(e) {
+    e.preventDefault();
+    if (e.pointerType === "touch") {
+      if (isPalm(e) || eraserId !== null) return;
+      if (penDownId !== null || (Date.now() - lastPenTime) < 300) return; // palm guard near pen use
+      eraserId = e.pointerId;
+      eraseSnapshotPending = JSON.parse(JSON.stringify(strokes));
+      eraserPos = [e.clientX, e.clientY];
+      if (eraseAt(e.clientX, e.clientY)) save();
+      redraw();
+      return;
+    }
+    // pen or mouse writes
+    lastPenTime = Date.now();
+    penDownId = e.pointerId;
+    pushUndo();
+    current = { pts: [pointOf(e)] };
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    redraw();
+  }
+
+  function onMove(e) {
+    e.preventDefault();
+    if (e.pointerType === "touch") {
+      if (e.pointerId !== eraserId) return;
+      eraserPos = [e.clientX, e.clientY];
+      var hit = eraseAt(e.clientX, e.clientY);
+      redraw();
+      if (hit) save();
+      return;
+    }
+    if (penDownId !== e.pointerId || !current) return;
+    lastPenTime = Date.now();
+    var events = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+    if (!events.length) events = [e];
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = inkColor();
+    for (var i = 0; i < events.length; i++) {
+      var pt = pointOf(events[i]);
+      var prev = current.pts[current.pts.length - 1];
+      current.pts.push(pt);
+      drawSegment(prev, pt);
+    }
+  }
+
+  function onUp(e) {
+    e.preventDefault();
+    if (e.pointerType === "touch") {
+      if (e.pointerId !== eraserId) return;
+      eraserId = null;
+      eraserPos = null;
+      eraseSnapshotPending = null;
+      redraw();
+      return;
+    }
+    if (penDownId !== e.pointerId) return;
+    penDownId = null;
+    lastPenTime = Date.now();
+    if (current && current.pts.length) {
+      strokes.push(current);
+      save();
+    } else {
+      undoStack.pop(); // empty stroke: discard the snapshot we pushed on down
+    }
+    current = null;
+    redraw();
+  }
+
+  canvas.addEventListener("pointerdown", onDown, { passive: false });
+  canvas.addEventListener("pointermove", onMove, { passive: false });
+  canvas.addEventListener("pointerup", onUp, { passive: false });
+  canvas.addEventListener("pointercancel", onUp, { passive: false });
+
+  // kill pinch-zoom / double-tap-zoom / long-press artifacts
+  document.addEventListener("gesturestart", function (e) { e.preventDefault(); }, { passive: false });
+  document.addEventListener("dblclick", function (e) { e.preventDefault(); }, { passive: false });
+  canvas.addEventListener("touchstart", function (e) { e.preventDefault(); }, { passive: false });
+  document.addEventListener("contextmenu", function (e) { e.preventDefault(); });
+
+  // ---- buttons ----
+  document.getElementById("undo").addEventListener("click", undo);
+  document.getElementById("clr").addEventListener("click", function () {
+    if (!strokes.length) return;
+    pushUndo();
+    strokes = [];
+    current = null;
+    redraw();
+    save();
+  });
+  document.getElementById("theme").addEventListener("click", function () {
+    document.body.classList.toggle("light");
+    redraw();
+    save();
+  });
+
+  // ---- lifecycle ----
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", function () { setTimeout(resize, 250); });
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "hidden") {
+      // flush save immediately when app is hidden/closed
+      clearTimeout(saveTimer);
+      try {
+        localStorage.setItem(KEY, JSON.stringify({
+          v: 1,
+          theme: document.body.classList.contains("light") ? "light" : "dark",
+          strokes: strokes
+        }));
+      } catch (e) {}
+    }
+  });
+
+  // hint fades after 4 s
+  setTimeout(function () { document.getElementById("hint").style.opacity = "0"; }, 4000);
+
+  // offline support
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("sw.js").catch(function () {});
+  }
+
+  load();
+  resize();
+})();
+/* v1.0 */
+</script>
+</body>
+</html>
