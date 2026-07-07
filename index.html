@@ -105,7 +105,10 @@
 
   var BASE_W = 3.2;        // base ink width (CSS px)
   var ERASE_R = 26;        // eraser hit radius (CSS px)
-  var PALM_W = 35;         // touches wider than this are ignored (palm)
+  var PALM_W = 90;         // touches wider than this are ignored (palm).
+                           // iPad Safari reports a normal fingertip as ~40-50 CSS px
+                           // (width = 2x contact radius), so the old 35 rejected
+                           // every finger. Palms report well over 100.
 
   // ---- canvas sizing ----
   function resize() {
@@ -354,7 +357,7 @@
   load();
   resize();
 })();
-/* v1.0 */
+/* v1.1 — finger-erase palm threshold fix */
 </script>
 </body>
 </html>

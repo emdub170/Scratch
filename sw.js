@@ -1,5 +1,5 @@
 /* Cockpit Scratchpad service worker — cache-first so the app opens with no signal. */
-var CACHE = "scratchpad-v1";
+var CACHE = "scratchpad-v2";
 var ASSETS = ["./", "./index.html", "./icon.png"];
 
 self.addEventListener("install", function (e) {
