@@ -61,6 +61,24 @@
     -webkit-tap-highlight-color: transparent;
   }
   #bar button:active { opacity: 0.5; }
+  #grab {
+    position: fixed;
+    top: env(safe-area-inset-top, 0px);
+    left: 30%;
+    width: 40%;
+    height: 30px;
+    z-index: 9;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    /* swallows touches: nothing under it can write or erase */
+  }
+  #grab .pill {
+    width: 56px;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--btn-border);
+  }
   #hint {
     position: fixed;
     bottom: calc(env(safe-area-inset-bottom, 0px) + 10px);
@@ -77,6 +95,7 @@
 </head>
 <body>
 <canvas id="pad"></canvas>
+<div id="grab"><div class="pill"></div></div>
 <div id="bar">
   <button id="undo" aria-label="Undo">UNDO</button>
   <button id="clr" aria-label="Clear">CLR</button>
@@ -104,7 +123,7 @@
   var saveTimer = null;
 
   var BASE_W = 3.2;        // base ink width (CSS px)
-  var ERASE_R = 26;        // eraser hit radius (CSS px)
+  var ERASE_R = 14;        // eraser hit radius (CSS px) — small for precision
   var PALM_W = 90;         // touches wider than this are ignored (palm).
                            // iPad Safari reports a normal fingertip as ~40-50 CSS px
                            // (width = 2x contact radius), so the old 35 rejected
@@ -199,26 +218,69 @@
     save();
   }
 
-  // ---- erase ----
+  // ---- erase (partial: cuts points under the eraser, splits strokes at the gap) ----
+  function dist2(ax, ay, bx, by) {
+    var dx = ax - bx, dy = ay - by;
+    return dx * dx + dy * dy;
+  }
+
+  // squared distance from point (px,py) to segment a-b
+  function segDist2(px, py, ax, ay, bx, by) {
+    var abx = bx - ax, aby = by - ay;
+    var len2 = abx * abx + aby * aby;
+    if (len2 === 0) return dist2(px, py, ax, ay);
+    var t = ((px - ax) * abx + (py - ay) * aby) / len2;
+    t = Math.max(0, Math.min(1, t));
+    return dist2(px, py, ax + t * abx, ay + t * aby);
+  }
+
   function eraseAt(x, y) {
-    var hit = false;
-    for (var i = strokes.length - 1; i >= 0; i--) {
+    var R2 = ERASE_R * ERASE_R;
+    var changed = false;
+    var out = [];
+    for (var i = 0; i < strokes.length; i++) {
       var p = strokes[i].pts;
+      if (p.length === 1) {
+        if (dist2(x, y, p[0][0], p[0][1]) <= R2) { changed = true; }
+        else { out.push(strokes[i]); }
+        continue;
+      }
+      var cut = new Array(p.length);
+      var any = false;
       for (var j = 0; j < p.length; j++) {
-        var dx = p[j][0] - x, dy = p[j][1] - y;
-        if (dx * dx + dy * dy <= ERASE_R * ERASE_R) {
-          if (eraseSnapshotPending) {
-            undoStack.push(eraseSnapshotPending);
-            if (undoStack.length > 25) undoStack.shift();
-            eraseSnapshotPending = null;
-          }
-          strokes.splice(i, 1);
-          hit = true;
-          break;
+        cut[j] = dist2(x, y, p[j][0], p[j][1]) <= R2;
+        if (cut[j]) any = true;
+      }
+      // eraser can cross a segment without being near either endpoint
+      for (j = 1; j < p.length; j++) {
+        if (!cut[j - 1] && !cut[j] &&
+            segDist2(x, y, p[j - 1][0], p[j - 1][1], p[j][0], p[j][1]) <= R2) {
+          cut[j - 1] = cut[j] = true;
+          any = true;
         }
       }
+      if (!any) { out.push(strokes[i]); continue; }
+      changed = true;
+      // surviving runs of >=2 points become their own strokes
+      var run = [];
+      for (j = 0; j < p.length; j++) {
+        if (!cut[j]) { run.push(p[j]); }
+        else if (run.length) {
+          if (run.length >= 2) out.push({ pts: run });
+          run = [];
+        }
+      }
+      if (run.length >= 2) out.push({ pts: run });
     }
-    return hit;
+    if (changed) {
+      if (eraseSnapshotPending) {
+        undoStack.push(eraseSnapshotPending);
+        if (undoStack.length > 25) undoStack.shift();
+        eraseSnapshotPending = null;
+      }
+      strokes = out;
+    }
+    return changed;
   }
 
   // ---- pointer handling ----
@@ -357,7 +419,7 @@
   load();
   resize();
 })();
-/* v1.1 — finger-erase palm threshold fix */
+/* v1.2 — partial erase with stroke splitting, smaller eraser, top grab strip */
 </script>
 </body>
 </html>
